@@ -5,6 +5,25 @@ import kornia.filters as kfilts
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .utils import ResBlock, StandardBlock, Down, Up, OutConv, ResBlock_periodic, StandardBlock_periodic, Down_periodic, Up_periodic, OutConv_periodic
+
+class dynamical_l96_Phicost(nn.Module):
+    def __init__(self, F=8.0):
+        super().__init__()
+        self.F = F
+
+    def forward(self, x):
+        # x is of shape [Batch , 1, Time, Lat]
+        x_ip1 = torch.roll(x, shifts=-1, dims=-1)
+        x_im1 = torch.roll(x, shifts=1, dims=-1)
+        x_im2 = torch.roll(x, shifts=2, dims=-1)
+
+        dxdt = (x_ip1 - x_im2) * x_im1 - x + self.F
+        return dxdt.abs().mean(dim=-1).mean(dim=-1)
+    
+    def forward_dyn(self, x):
+        return self.forward(x)
+
 
 class Lit4dVarNet(pl.LightningModule):
     def __init__(self, solver, rec_weight, opt_fn, test_metrics=None, pre_metric_fn=None, norm_stats=None, persist_rw=True):
@@ -48,17 +67,18 @@ class Lit4dVarNet(pl.LightningModule):
     def step(self, batch, phase=""):
         if self.training and batch.tgt.isfinite().float().mean() < 0.9:
             return None, None
-
+        
         loss, out = self.base_step(batch, phase)
-        grad_loss = self.weighted_mse( kfilts.sobel(out) - kfilts.sobel(batch.tgt), self.rec_weight)
+        #grad_loss = self.weighted_mse( kfilts.sobel(out) - kfilts.sobel(batch.tgt), self.rec_weight)
         prior_cost = self.solver.prior_cost(self.solver.init_state(batch, out))
-        self.log( f"{phase}_gloss", grad_loss, prog_bar=True, on_step=False, on_epoch=True)
-
-        training_loss = 50 * loss + 1000 * grad_loss + 1.0 * prior_cost
+        #self.log( f"{phase}_gloss", grad_loss, prog_bar=True, on_step=False, on_epoch=True)
+#
+        training_loss =  50 * loss  + 100.0 * prior_cost #+ 1000 * grad_loss
         return training_loss, out
 
     def base_step(self, batch, phase=""):
         out = self(batch=batch)
+        #print("rec_weight shape:", self.rec_weight.shape)
         loss = self.weighted_mse(out - batch.tgt, self.rec_weight)
 
         with torch.no_grad():
@@ -192,6 +212,7 @@ class ConvLstmGradModel(nn.Module):
         ]
 
     def forward(self, x):
+        #print(x.shape) # [32, 1, 200, 40] = [Batch, Channel, Time, Lat]
         if self._grad_norm is None:
             self._grad_norm = (x**2).mean().sqrt()
         x =  x / self._grad_norm
@@ -259,7 +280,7 @@ class BilinAEPriorCost(nn.Module):
         )
 
     def forward_ae(self, x):
-        #print(x.shape) # [32, 1, 200, 40] = [Batch, Channel, Time, Lat]
+        #print(x.shape)  [32, 1, 200, 40] = [Batch, Channel, Time, Lat]
         x = self.down(x)
         x = self.conv_in(x)
         x = self.conv_hidden(F.relu(x))
@@ -269,9 +290,6 @@ class BilinAEPriorCost(nn.Module):
             torch.cat([self.bilin_1(x), nonlin], dim=1)
         )
         x = self.up(x)
-        # Current indices: 0:B, 1:Lon, 2:Time, 3:Lat
-        # Target indices:  0:B, 3:Lon,  1:Time, 2:Lat
-        #x = x.permute(0, 2, 3, 1) # Now back to [B, 200, 40, 1] # changed here ..
         return x
 
     def forward(self, state):
@@ -279,6 +297,60 @@ class BilinAEPriorCost(nn.Module):
 
     
 #------------Unet inversion model----------------
+
+class UNet(nn.Module):
+    """We modify the UNet to take as input the observations also making the periodic BCs.
+    For this, we have individually modified each block to include periodic BCs.
+    If You want to remove the periodic, just change the blocks to the normal ones."""
+    def __init__(self, n_channels=1, n_classes=1, channel_dims=None, bilinear = True, block = ResBlock, add_input=False ):
+        super(UNet, self).__init__()
+        self.add_input = add_input
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+        factor = 2 if bilinear else 1
+        channel_dims = channel_dims or [32, 64, 128]
+
+        # block-wise weight scaling factors for stabilised gradients
+        sfs = 1/torch.arange(1, 10).sqrt()
+        
+        # define modules
+        self.inc = StandardBlock(n_channels, channel_dims[0])
+        self.down1 = Down(channel_dims[0], channel_dims[1], block, sf=sfs[1])
+        self.down2 = Down(channel_dims[1], channel_dims[2] //factor , block, sf=sfs[2])
+        #self.down3 = Down_periodic(64, 128 // factor, block, sf=sfs[3])
+
+        #self.up1 = Up_periodic(128, 64 // factor, block, bilinear, sf=sfs[3])
+        self.up1 = Up(channel_dims[2], channel_dims[1] // factor, block, bilinear, sf=sfs[4])
+        self.up2 = Up(channel_dims[1] , channel_dims[0], block, bilinear, sf=sfs[5])
+        self.outc = OutConv(channel_dims[0], n_classes)
+
+
+        # self.inc = StandardBlock(n_channels, 16)
+        # self.down1 = Down(16, 32, block, sf=sfs[1])
+        # self.down2 = Down(32, 64 //factor , block, sf=sfs[2])
+        # #self.down3 = Down_periodic(64, 128 // factor, block, sf=sfs[3])
+
+        # #self.up1 = Up_periodic(128, 64 // factor, block, bilinear, sf=sfs[3])
+        # self.up1 = Up(64, 32 // factor, block, bilinear, sf=sfs[4])
+        # self.up2 = Up(32, 16, block, bilinear, sf=sfs[5])
+        # self.outc = OutConv(16, n_classes)
+
+    def forward(self, x):
+        if self.add_input:
+            inp = x.input[:,-1].unsqueeze(1)
+        x1 = self.inc(torch.nan_to_num(x.input))
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        #x4 = self.down3(x3)
+        
+        x = self.up1(x3, x2)
+        x = self.up2(x, x1)
+        
+        out = self.outc(x)
+        if self.add_input:
+            out += inp
+        return out
 # Lit4dVarNet for just UNet(no prior, no grad solver):
 
 class LitUnet_like_4dVarNet(Lit4dVarNet):
@@ -300,7 +372,7 @@ class LitUnet_like_4dVarNet(Lit4dVarNet):
         grad_loss = self.weighted_mse( kfilts.sobel(out) - kfilts.sobel(batch.tgt), self.rec_weight)
         self.log( f"{phase}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        training_loss = 50 * loss + 1000 * grad_loss 
+        training_loss = 50 * loss + 10 * grad_loss 
         return training_loss, out
 
     def base_step(self, batch, phase=""):

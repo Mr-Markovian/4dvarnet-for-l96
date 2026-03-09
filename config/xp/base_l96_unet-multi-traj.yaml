@@ -32,15 +32,15 @@ trainer:
       filename: '{val_mse:.5f}-{epoch:03d}'
 
 datamodule:
-  _target_: contrib.L96.data.BaseDataModule
-  input_da: 
-    _target_: contrib.L96.utils.load_l96_data
-    path:  ${paths.l96} # ${paths.natl_gf_5nads}
+  _target_: contrib.L96.data.MultiTrajDataModule
+  input_das: 
+    _target_: contrib.L96.utils.load_l96_data_multi
+    paths: ${paths.l96_trajectories} 
   domains:
     train:
       time: {_target_: builtins.slice, _args_: [20000, 80000]}
     val: 
-      time: {_target_: builtins.slice, _args_: [10000, 20000]}
+      time: {_target_: builtins.slice, _args_: [11000, 19000]}
     test: 
       time: {_target_: builtins.slice,  _args_: [1000, 10000]}
   xrds_kw:
@@ -75,14 +75,14 @@ model:
       _target_: contrib.L96.utils.ResBlock_periodic
       _partial_: True
     add_input: True
-    channel_dims: [16,32,64]
+    channel_dims: [32,64,128] #[16,32,64]
       
        
   test_metrics: ${metrics.test_metrics}
   pre_metric_fn: 
         _target_: xarray.Dataset.sel
         _partial_: True
-        time: {_target_: builtins.slice, _args_: [1000, 5000]}
+        time: {_target_: builtins.slice, _args_: [1000, 10000]}
         lat: ${domain.test.lat}
         lon: ${domain.test.lon}
 

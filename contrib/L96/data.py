@@ -54,7 +54,7 @@ class XrDataset(torch.utils.data.Dataset):
             dim: max((da_dims[dim] - patch_dims[dim]) // self.strides.get(dim, 1) + 1, 0)
             for dim in patch_dims
         }
-
+    
         print(da_dims)
         print(self.ds_size)
 
@@ -117,8 +117,8 @@ class XrDataset(torch.utils.data.Dataset):
         item = item.data.astype(np.float32)
         if self.postpro_fn is not None:
             return self.postpro_fn(item)
-        print(item.tgt.shape)
-        print(item.inp.shape)
+        #print(item.tgt.shape)
+        #print(item.inp.shape)
         return item
 
     def reconstruct(self, batches, weight=None):
@@ -213,6 +213,8 @@ class AugmentedDataset(torch.utils.data.Dataset):
         return item._replace(input=noise + np.where(np.isfinite(perm_item.input),
                              item.tgt, np.full_like(item.tgt,np.nan)))
 
+
+
 class BaseDataModule(pl.LightningDataModule):
     def __init__(self, input_da, domains, xrds_kw, dl_kw, aug_kw=None, norm_stats=None, **kwargs):
         super().__init__()
@@ -235,7 +237,7 @@ class BaseDataModule(pl.LightningDataModule):
         return self._norm_stats
 
     def train_mean_std(self, variable='tgt'): 
-        train_data = self.input_da.isel(self.xrds_kw.get('domain_limits', {})).isel(self.domains['train'])
+        train_data = self.input_da.isel(self.xrds_kw.get('domain_limits', {})).sel(self.domains['train'])
         return train_data.sel(variable=variable).pipe(lambda da: (da.mean().values.item(), da.std().values.item()))
 
     def post_fn(self): # ***** This is the change currently...
@@ -259,8 +261,8 @@ class BaseDataModule(pl.LightningDataModule):
         self.train_ds = XrDataset(
             train_data, **self.xrds_kw, postpro_fn=post_fn,
         )
-        if self.aug_kw:
-            self.train_ds = AugmentedDataset(self.train_ds, **self.aug_kw)
+        # if self.aug_kw:
+        #     self.train_ds = AugmentedDataset(self.train_ds, **self.aug_kw)
 
         self.val_ds = XrDataset(
             self.input_da.isel(self.domains['val']), **self.xrds_kw, postpro_fn=post_fn,
@@ -268,7 +270,6 @@ class BaseDataModule(pl.LightningDataModule):
         self.test_ds = XrDataset(
             self.input_da.isel(self.domains['test']), **self.xrds_kw, postpro_fn=post_fn,
         )
-
 
     def train_dataloader(self):
         return  torch.utils.data.DataLoader(self.train_ds, shuffle=True, **self.dl_kw)
@@ -332,3 +333,70 @@ class RandValDataModule(BaseDataModule):
 
         self.test_ds = XrDataset(self.input_da.sel(self.domains['test']), **self.xrds_kw, postpro_fn=post_fn,)
 
+
+# New addition for multiple time sereis
+class MultiTrajDataModule(pl.LightningDataModule):
+    def __init__(self, input_das, domains, xrds_kw, dl_kw, aug_kw=None, norm_stats=None, **kwargs):
+        super().__init__()
+        self.input_das = input_das  # now a LIST of xarray DataArrays, one per trajectory
+        self.domains = domains
+        self.xrds_kw = xrds_kw
+        self.dl_kw = dl_kw
+        self.aug_kw = aug_kw if aug_kw is not None else {}
+        self._norm_stats = norm_stats
+
+        self.train_ds = None
+        self.val_ds = None
+        self.test_ds = None
+
+    def norm_stats(self):
+        if self._norm_stats is None:
+            self._norm_stats = self.train_mean_std()
+            print("Norm stats", self._norm_stats)
+        return self._norm_stats
+
+    def train_mean_std(self, variable='tgt'):
+        # compute stats across ALL trajectories jointly
+        all_train = xr.concat(
+            [da.isel(self.domains['train']) for da in self.input_das],
+            dim='time'
+        )
+        return all_train.sel(variable=variable).pipe(
+            lambda da: (da.mean().values.item(), da.std().values.item())
+        )
+
+    def post_fn(self):
+        m, s = self.norm_stats()
+        normalize = lambda item: (item - m) / s
+
+        def squeeze_lon_and_add_channel(x):
+            x = np.squeeze(x, axis=-1)
+            return x[None, ...]
+
+        return ft.partial(ft.reduce, lambda i, f: f(i), [
+            TrainingItem._make,
+            lambda item: item._replace(tgt=squeeze_lon_and_add_channel(normalize(item.tgt))),
+            lambda item: item._replace(input=squeeze_lon_and_add_channel(normalize(item.input))),
+        ])
+
+    def _make_concat_ds(self, split, post_fn):
+        datasets = [
+            XrDataset(da.isel(self.domains[split]), **self.xrds_kw, postpro_fn=post_fn)
+            for da in self.input_das
+        ]
+        return torch.utils.data.ConcatDataset(datasets)  # key line
+
+    def setup(self, stage='test'):
+        post_fn = self.post_fn()
+        self.train_ds = self._make_concat_ds('train', post_fn)
+        self.val_ds   = self._make_concat_ds('val',   post_fn)
+        self.test_ds  = self._make_concat_ds('test',  post_fn)
+
+    def train_dataloader(self):
+        return torch.utils.data.DataLoader(self.train_ds, shuffle=True, **self.dl_kw)
+
+    def val_dataloader(self):
+        return torch.utils.data.DataLoader(self.val_ds, shuffle=False, **self.dl_kw)
+
+    def test_dataloader(self):
+        return torch.utils.data.DataLoader(self.test_ds, shuffle=False, **self.dl_kw)

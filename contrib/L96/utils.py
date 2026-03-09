@@ -7,6 +7,17 @@ import src.data
 import xarray as xr
 import os
 
+def cosanneal_lr_adam_UNet(lit_mod, lr, T_max=100, weight_decay=0.):
+    opt = torch.optim.Adam(
+        [
+            {"params": lit_mod.solver.parameters(), "lr": lr},
+        ], weight_decay=weight_decay 
+    )
+    return {
+        "optimizer": opt,
+        "lr_scheduler": torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=T_max),
+    }
+
 def get_constant_crop(patch_dims, crop, dim_order=("time", "lat", "lon")):
     """
     Returns a 0/1 crop mask with shape [time, lat, lon] (if lon exists)
@@ -73,12 +84,26 @@ def get_triang_time_wei(patch_dims, offset=0, crop=None, dim_order=("time", "lat
     return w[None, ...]
 
 
-def get_constant_time_wei(patch_dims, offset=0, **crop_kw):
+def get_constant_time_wei(patch_dims, offset=0, crop=None, dim_order=("time", "lat", "lon")):
     """
     Returns a constant weighting mask (all ones in the non-cropped region, zeros elsewhere)
-    with the same shape as the patch (e.g., [time, lat, lon]).
+    with shape [1, time, lat], compatible with get_triang_time_wei.
     """
-    return get_constant_crop(patch_dims, crop_kw)
+    crop = crop or {}
+
+    pw = get_constant_crop(patch_dims, crop=crop, dim_order=dim_order)
+    # pw shape: [time, lat, lon] or [time, lat]
+
+    # Squeeze lon if present
+    if pw.ndim == 3:
+        w = np.squeeze(pw, axis=-1)   # drop lon -> [time, lat]
+    elif pw.ndim == 2:
+        w = pw
+    else:
+        raise ValueError(f"Unexpected pw.ndim={pw.ndim}, pw.shape={pw.shape}")
+
+    # Add channel dim -> [1, time, lat]
+    return w[None, ...]
 
 
 def load_l96_data(path, obs_from_tgt=False):
@@ -97,6 +122,19 @@ def load_l96_data(path, obs_from_tgt=False):
         .to_array()
     )
 
+
+def load_l96_data_multi(paths):
+    """Load multiple trajectory netCDFs, return list of DataArrays"""
+    return [load_l96_data(p) for p in paths]
+
+# For later if we keep adding trajectories and want to load them all at once:
+# def load_l96_data_multi(path_pattern):
+#     """Load all matching files e.g. '/data/L96_traj_*.nc'"""
+#     import glob
+#     paths = sorted(glob.glob(path_pattern))
+#     print(f"Found {len(paths)} trajectories")
+#     return [load_l96_data(p) for p in paths]
+
 def load_l96_data_identity(path, obs_from_tgt=False):
     ds = (
         xr.open_dataset(path)
@@ -112,3 +150,226 @@ def load_l96_data_identity(path, obs_from_tgt=False):
         .transpose("time", "lat", "lon")
         .to_array()
     )    
+
+
+# Unet parts 
+
+""" Parts of the U-Net model
+    -- modified from https://github.com/milesial/Pytorch-UNet """
+
+
+class StandardBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None,
+                 kernel_size=3, dilation=1, sf=None):
+        super().__init__()
+        padding = kernel_size // 2
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, mid_channels, kernel_size=kernel_size,
+                padding=padding, bias=False, dilation=dilation),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                mid_channels, out_channels, kernel_size=kernel_size,
+                padding=padding, bias=False, dilation=dilation),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+class StandardBlock_periodic(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None,
+                 kernel_size=3, dilation=1, sf=None):
+        super().__init__()
+        padding = kernel_size // 2
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, mid_channels, kernel_size=kernel_size,
+                padding=padding, padding_mode='circular', bias=False, dilation=dilation),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                mid_channels, out_channels, kernel_size=kernel_size,
+                padding=padding, padding_mode='circular', bias=False, dilation=dilation),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+    
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None,
+                 kernel_size=3, sf=1):
+        super().__init__()
+        self._scaling_factor = sf
+        
+        padding = kernel_size // 2
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, mid_channels, kernel_size=kernel_size,
+                padding=padding, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                mid_channels, out_channels, kernel_size=kernel_size,
+                padding=padding, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        if in_channels != out_channels:
+            self.projection_conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+class ResBlock_periodic(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None,
+                 kernel_size=3, sf=1):
+        super().__init__()
+        self._scaling_factor = sf
+        
+        padding = kernel_size // 2
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, mid_channels, kernel_size=kernel_size,
+                padding=padding, padding_mode='circular', bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                mid_channels, out_channels, kernel_size=kernel_size,
+                padding=padding, padding_mode='circular', bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        if in_channels != out_channels:
+            self.projection_conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, padding_mode='circular', bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        out = self.double_conv(x)
+
+        if hasattr(self, 'projection_conv'):
+            x = self.projection_conv(x)
+            
+        out = out * self._scaling_factor + x
+
+        return F.relu(out)
+
+
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
+
+    def __init__(self, in_channels, out_channels, block, **kwargs):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            block(in_channels, out_channels, **kwargs)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+class Down_periodic(nn.Module):
+    """Downscaling with maxpool then double conv"""
+
+    def __init__(self, in_channels, out_channels, block, **kwargs):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            block(in_channels, out_channels, **kwargs)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels, out_channels, block=ResBlock, bilinear=True,
+                 **kwargs):
+        super().__init__()
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.up = nn.Upsample(
+                scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = block(in_channels, out_channels, in_channels // 2,
+                              **kwargs)
+        else:
+            self.up = nn.ConvTranspose2d(
+                in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = block(in_channels, out_channels,
+                              **kwargs)
+
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+class Up_periodic(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels, out_channels, block=ResBlock_periodic, bilinear=True,
+                 **kwargs):
+        super().__init__()
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.up = nn.Upsample(
+                scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = block(in_channels, out_channels, in_channels // 2,
+                              **kwargs)
+        else:
+            self.up = nn.ConvTranspose2d(
+                in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = block(in_channels, out_channels,
+                              **kwargs)
+
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2], mode='circular')
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.out = nn.Conv2d(in_channels, out_channels, kernel_size=1,
+                             bias=False)
+
+    def forward(self, x):
+        return self.out(x)
+    
+class OutConv_periodic(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv_periodic, self).__init__()
+        self.out = nn.Conv2d(in_channels, out_channels, kernel_size=1,
+                             bias=False, padding_mode='circular')
+
+    def forward(self, x):
+        return self.out(x)
+        
