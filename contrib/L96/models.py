@@ -7,22 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .utils import ResBlock, StandardBlock, Down, Up, OutConv, ResBlock_periodic, StandardBlock_periodic, Down_periodic, Up_periodic, OutConv_periodic
 
-class dynamical_l96_Phicost(nn.Module):
-    def __init__(self, F=8.0):
-        super().__init__()
-        self.F = F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    def forward(self, x):
-        # x is of shape [Batch , 1, Time, Lat]
-        x_ip1 = torch.roll(x, shifts=-1, dims=-1)
-        x_im1 = torch.roll(x, shifts=1, dims=-1)
-        x_im2 = torch.roll(x, shifts=2, dims=-1)
-
-        dxdt = (x_ip1 - x_im2) * x_im1 - x + self.F
-        return dxdt.abs().mean(dim=-1).mean(dim=-1)
-    
-    def forward_dyn(self, x):
-        return self.forward(x)
 
 
 class Lit4dVarNet(pl.LightningModule):
@@ -43,6 +31,13 @@ class Lit4dVarNet(pl.LightningModule):
         elif self.trainer.datamodule is not None:
             return self.trainer.datamodule.norm_stats()
         return (0., 1.)
+    
+    def setup(self, stage: str) -> None:
+        # Runs once — injects into the dynamical prior at the right moment
+        mean, std = self.norm_stats
+        prior = self.solver.prior_cost
+        if hasattr(prior, "set_norm_stats"):
+            prior.set_norm_stats(mean, std)
 
     @staticmethod
     def weighted_mse(err, weight):
@@ -70,10 +65,12 @@ class Lit4dVarNet(pl.LightningModule):
         
         loss, out = self.base_step(batch, phase)
         #grad_loss = self.weighted_mse( kfilts.sobel(out) - kfilts.sobel(batch.tgt), self.rec_weight)
-        prior_cost = self.solver.prior_cost(self.solver.init_state(batch, out))
+
+        # If using a dynamical prior, we don't add it's cost.???
+        # prior_cost = self.solver.prior_cost(self.solver.init_state(batch, out))
         #self.log( f"{phase}_gloss", grad_loss, prog_bar=True, on_step=False, on_epoch=True)
 #
-        training_loss =  50 * loss  + 100.0 * prior_cost #+ 1000 * grad_loss
+        training_loss =  50 * loss #+ 1* prior_cost
         return training_loss, out
 
     def base_step(self, batch, phase=""):
@@ -93,17 +90,28 @@ class Lit4dVarNet(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         if batch_idx == 0:
             self.test_data = []
+
         out = self(batch=batch)
         m, s = self.norm_stats
 
+        # Réarranger les dimensions : (B,C,H,W) -> (B,H,W,C)
+        batch_input = (batch.input.cpu() * s + m).permute(0, 2, 3, 1)
+        batch_tgt = (batch.tgt.cpu() * s + m).permute(0, 2, 3, 1)
+        out_data = (out.squeeze(dim=-1).detach().cpu() * s + m).permute(0, 2, 3, 1)
+
         self.test_data.append(torch.stack(
-            [
-                batch.input.cpu() * s + m,
-                batch.tgt.cpu() * s + m,
-                out.squeeze(dim=-1).detach().cpu() * s + m,
-            ],
-            dim=1,
+            [batch_input, batch_tgt, out_data],
+            dim=1
         ))
+
+        # self.test_data.append(torch.stack(
+        #     [
+        #         batch.input.cpu() * s + m,
+        #         batch.tgt.cpu() * s + m,
+        #         out.squeeze(dim=-1).detach().cpu() * s + m,
+        #     ],
+        #     dim=1,
+        # ))
 
     @property
     def test_quantities(self):
@@ -120,8 +128,13 @@ class Lit4dVarNet(pl.LightningModule):
         self.test_data = rec_da.assign_coords(
             dict(v0=self.test_quantities)
         ).to_dataset(dim='v0')
+# Reset/drop duplicate coordinates before applying pre_metric_fn
+        metric_data = self.test_data.reset_coords(drop=True)
+        
+        if self.pre_metric_fn is not None:
+            metric_data = metric_data.pipe(self.pre_metric_fn)
 
-        metric_data = self.test_data.pipe(self.pre_metric_fn)
+        #metric_data = self.test_data.pipe(self.pre_metric_fn)
         metrics = pd.Series({
             metric_n: metric_fn(metric_data) 
             for metric_n, metric_fn in self.metrics.items()
@@ -337,8 +350,8 @@ class UNet(nn.Module):
         # self.outc = OutConv(16, n_classes)
 
     def forward(self, x):
-        if self.add_input:
-            inp = x.input[:,-1].unsqueeze(1)
+        # if self.add_input:
+        #     inp = x.input[:,-1].unsqueeze(1)
         x1 = self.inc(torch.nan_to_num(x.input))
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -348,8 +361,8 @@ class UNet(nn.Module):
         x = self.up2(x, x1)
         
         out = self.outc(x)
-        if self.add_input:
-            out += inp
+        # if self.add_input:
+        #     out += inp
         return out
 # Lit4dVarNet for just UNet(no prior, no grad solver):
 
@@ -372,7 +385,7 @@ class LitUnet_like_4dVarNet(Lit4dVarNet):
         grad_loss = self.weighted_mse( kfilts.sobel(out) - kfilts.sobel(batch.tgt), self.rec_weight)
         self.log( f"{phase}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        training_loss = 50 * loss + 10 * grad_loss 
+        training_loss = 50 * loss #+ 10 * grad_loss 
         return training_loss, out
 
     def base_step(self, batch, phase=""):

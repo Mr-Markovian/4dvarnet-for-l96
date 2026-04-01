@@ -117,8 +117,6 @@ class XrDataset(torch.utils.data.Dataset):
         item = item.data.astype(np.float32)
         if self.postpro_fn is not None:
             return self.postpro_fn(item)
-        #print(item.tgt.shape)
-        #print(item.inp.shape)
         return item
 
     def reconstruct(self, batches, weight=None):
@@ -138,7 +136,14 @@ class XrDataset(torch.utils.data.Dataset):
         if weight is None:
             weight = np.ones(list(self.patch_dims.values()))
         w = xr.DataArray(weight, dims=list(self.patch_dims.keys()))
-
+        #Re positionner les axes de w
+        w = w.rename({
+            "time": "lon",
+            "lat": "time",
+            "lon": "lat"
+            })
+        w = w.transpose("time", "lat", "lon")
+        
         coords = self.get_coords()
 
         new_dims = [f'v{i}' for i in range(len(items[0].shape) - len(coords[0].dims))]
@@ -335,6 +340,34 @@ class RandValDataModule(BaseDataModule):
 
 
 # New addition for multiple time sereis
+class MultiTrajDataset(torch.utils.data.ConcatDataset):
+    """
+    ConcatDataset that exposes reconstruct by delegating per sub-dataset.
+    Each sub-dataset is an XrDataset with its own reconstruct method.
+    """
+
+    def reconstruct(self, batches, weight=None):
+        """
+        Split batches back to per-trajectory chunks, reconstruct each,
+        then concatenate along time.
+        
+        batches: list of [B, v0, time, lat] tensors (full test set, in order)
+        """
+        # Step 1: flatten batches into individual items, same as XrDataset.reconstruct
+        items = list(itertools.chain(*batches))
+
+        # Step 2: split items per trajectory based on each dataset's length
+        rec_das = []
+        offset = 0
+        for ds in self.datasets:
+            n_items = len(ds)  # number of patches in this trajectory
+            traj_items = items[offset:offset + n_items]
+            rec_das.append(ds.reconstruct_from_items(traj_items, weight))
+            offset += n_items
+
+        # Step 3: concatenate along time
+        return xr.concat(rec_das, dim='time')
+
 class MultiTrajDataModule(pl.LightningDataModule):
     def __init__(self, input_das, domains, xrds_kw, dl_kw, aug_kw=None, norm_stats=None, **kwargs):
         super().__init__()
@@ -384,7 +417,7 @@ class MultiTrajDataModule(pl.LightningDataModule):
             XrDataset(da.isel(self.domains[split]), **self.xrds_kw, postpro_fn=post_fn)
             for da in self.input_das
         ]
-        return torch.utils.data.ConcatDataset(datasets)  # key line
+        return MultiTrajDataset(datasets)  # key line
 
     def setup(self, stage='test'):
         post_fn = self.post_fn()
