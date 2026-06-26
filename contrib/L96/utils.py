@@ -127,6 +127,11 @@ def load_l96_data_multi(paths):
     """Load multiple trajectory netCDFs, return list of DataArrays"""
     return [load_l96_data(p) for p in paths]
 
+
+def load_l96_data_multi_low_observation_frequency(paths):
+    """Load multiple trajectory netCDFs, return list of DataArrays"""
+    return [load_l96_data_with_low_observation_frequency(p) for p in paths]
+
 # For later if we keep adding trajectories and want to load them all at once:
 # def load_l96_data_multi(path_pattern):
 #     """Load all matching files e.g. '/data/L96_traj_*.nc'"""
@@ -151,6 +156,51 @@ def load_l96_data_identity(path, obs_from_tgt=False):
         .to_array()
     )    
 
+
+def add_nans_every_ko_timesteps(ds, ko=4):
+    """
+    Add NaNs to observations with pattern: 3 consecutive NaN time points, then 1 observation, repeating.
+    Pattern: NaN, NaN, NaN, OBS, NaN, NaN, NaN, OBS, ...
+    
+    Modifies the 'input' field of the dataset in-place to follow this mask pattern.
+    The 'tgt' (target) field remains unchanged.
+    """
+    input_data = ds['input'].copy()
+    time_dim = input_data.dims[0]  # Assuming time is first dimension
+    n_time = input_data.sizes[time_dim]
+    
+    # Create mask: every 4 timesteps, only the 4th one (index 3, 7, 11, ...) has observations
+    for t in range(n_time):
+        if (t + 1) % ko != 0:  # NaN for positions 0, 1, 2, 4, 5, 6, 8, 9, 10, ...
+            input_data[{time_dim: t}] = np.nan
+    
+    # Update the dataset with the NaN-masked input
+    ds['input'] = input_data
+    return ds
+
+
+def load_l96_data_with_low_observation_frequency(path, obs_from_tgt=False, ko=4):
+    """
+    Load L96 data and add NaNs to observations with pattern: 
+    3 consecutive NaN time points, then 1 observation, repeating.
+    """
+    ds = (
+        xr.open_dataset(path)
+        .load()
+        .assign(
+            input=lambda ds: ds['obs'],
+            tgt=lambda ds: ds['truth']
+        )
+    )
+    
+    # Add NaN masking to observations
+    ds = add_nans_every_ko_timesteps(ds)
+    
+    return (
+        ds[[*src.data.TrainingItem._fields]]
+        .transpose("time", "lat", "lon")
+        .to_array()
+    )
 
 # Unet parts 
 

@@ -250,6 +250,58 @@ class ConvLstmGradModel(nn.Module):
         return out
 
 
+class Weak4dVarSolver(nn.Module):
+    """
+    Weak 4D-Var solver with a known dynamical model.
+    Optimization runs entirely inside forward():
+      1. n_warmup simple gradient steps with lr_grad (warm-start)
+      2. n_step closure-based steps with opt_fn (e.g. LBFGS or Adam)
+    opt_fn is a partial callable: opt_fn([state]) -> optimizer.
+    prior_cost must implement forward() (cost scalar) and forward_ae() (projection).
+    """
+    def __init__(self, prior_cost, obs_cost, n_step, opt_fn, lr_grad=0.2, n_warmup=1, **kwargs):
+        super().__init__()
+        self.prior_cost = prior_cost
+        self.obs_cost = obs_cost
+        self.n_step = n_step
+        self.lr_grad = lr_grad
+        self.n_warmup = n_warmup
+        self.opt_fn = opt_fn
+
+    def init_state(self, batch, x_init=None):
+        if x_init is not None:
+            return x_init
+
+        return batch.input.nan_to_num().detach().requires_grad_(True)
+
+    def forward(self, batch, init_state=None):
+        with torch.set_grad_enabled(True):
+            state = self.init_state(batch)
+
+            # Warmup: plain gradient steps to move away from initialisation
+            for _ in range(self.n_warmup):
+                var_cost = self.prior_cost(state) + self.obs_cost(state, batch)
+                var_cost.backward()
+                with torch.no_grad():
+                    state.data -= self.lr_grad * state.grad
+                state.grad = None
+
+            # Re-wrap as a clean leaf before handing to the main optimizer
+            state = state.detach().requires_grad_(True)
+            opt = self.opt_fn([state])
+
+            # Main loop: closure-based steps (works for LBFGS, Adam, SGD)
+            for _ in range(self.n_step):
+                def closure():
+                    opt.zero_grad()
+                    var_cost = self.prior_cost(state) + self.obs_cost(state, batch)
+                    var_cost.backward()
+                    return var_cost
+                opt.step(closure)
+
+        return state.detach()
+
+
 class BaseObsCost(nn.Module):
     def __init__(self, w=1) -> None:
         super().__init__()
@@ -397,3 +449,29 @@ class LitUnet_like_4dVarNet(Lit4dVarNet):
             self.log(f"{phase}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
         return loss, out    
+
+
+class LitWeak4dVar(Lit4dVarNet):
+    """
+    Lightning wrapper for weak 4D-Var with known L96 dynamics.
+    Inherits all test/logging/norm_stats infrastructure.
+    No outer training — solver.forward() IS the full optimization.
+    opt_fn is not used but kept optional for interface compatibility with Lit4dVarNet.
+    """
+    def __init__(self, solver, rec_weight, opt_fn=None, test_metrics=None,
+                 pre_metric_fn=None, norm_stats=None, persist_rw=True):
+        super().__init__(solver, rec_weight, opt_fn, test_metrics, pre_metric_fn,
+                         norm_stats, persist_rw)
+
+    def training_step(self, batch, batch_idx):
+        return None
+
+    def validation_step(self, batch, batch_idx):
+        # autograd must stay enabled — inner optimizer needs it during val/test
+        return self.step(batch, "val")[0]
+
+    def configure_optimizers(self):
+        dummy = nn.Parameter(torch.zeros(1), requires_grad=True)
+        self.register_parameter("_dummy", dummy)
+        return torch.optim.SGD([dummy], lr=0.0)
+

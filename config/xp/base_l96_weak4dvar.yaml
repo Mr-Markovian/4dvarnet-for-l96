@@ -1,0 +1,108 @@
+# @package _global_
+# Weak 4D-Var with known Lorenz-96 dynamics (no learned prior/grad_mod).
+# The full variational optimization (J_obs + J_dyn) is solved inside
+# Weak4dVarSolver.forward() using a configurable inner optimizer.
+
+paths:
+    l96_dir: /Odyssey/public/l96_dataset/
+    l96_trajectories_train:
+      - ${paths.l96_dir}/L96_truth_obs_mask_boc2010_single_traj_1.nc
+      
+    l96_trajectories_test:
+      - ${paths.l96_dir}/L96_truth_obs_mask_boc2010_single_traj_6.nc
+
+domain: ???
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  inference_mode: False        # solver needs autograd during val/test
+  gradient_clip_val: 0.        # no outer gradient to clip
+  accelerator: gpu
+  devices: 1
+  logger:
+    _target_: pytorch_lightning.loggers.CSVLogger
+    save_dir: ${hydra:runtime.output_dir}
+    name: ${hydra:runtime.choices.xp}
+    version: ''
+  max_epochs: 1                # nothing to train; run one epoch to reach test
+  callbacks: []   # nothing to checkpoint — no learned weights
+
+datamodule:
+  _target_: contrib.L96.data.MultiTrajDataModule
+  input_das:
+    _target_: contrib.L96.utils.load_l96_data_multi
+    paths: ${paths.l96_trajectories_train}
+  domains:
+    train:
+      time: {_target_: builtins.slice, _args_: [20000, 80000]}
+    val:
+      time: {_target_: builtins.slice, _args_: [11000, 19000]}
+    test:
+      time: {_target_: builtins.slice, _args_: [1000, 10000]}
+  xrds_kw:
+    patch_dims: { time: 200, lat: 40, lon: 1}
+    strides: { time: 50, lat: 40, lon: 1}
+    domain_limits: ${domain.train}
+  dl_kw: {batch_size: 32, num_workers: 2}
+
+model:
+  _target_: contrib.L96.models.LitWeak4dVar
+  persist_rw: False
+  # opt_fn is optional in LitWeak4dVar — omitted since configure_optimizers
+  # uses a dummy SGD internally and the real optimizer lives in solver.opt_fn
+  rec_weight:
+    _target_: ocean4dvarnet.utils.get_triang_time_wei
+    patch_dims: ${datamodule.xrds_kw.patch_dims}
+    crop: {time: 0, lat: 0, lon: 0}
+    offset: 1
+  solver:
+    _target_: contrib.L96.models.Weak4dVarSolver
+    n_step: 50        # number of inner optimizer steps per batch
+    lr_grad: 0.2      # unused by Weak4dVarSolver but kept for interface parity
+    # Inner optimizer: runs inside forward() over the trajectory state x.
+    # Switch to torch.optim.Adam (lr: 0.01) for smoother but slower convergence.
+    opt_fn:
+      _target_: torch.optim.LBFGS
+      _partial_: true
+      lr: 1.0
+      max_iter: 1
+      line_search_fn: strong_wolfe
+    prior_cost:
+      _target_: contrib.L96.models.Lorenz96ODEPrior
+      dt: 0.05
+      F_param: 8.0
+      scheme: rk4
+    obs_cost:
+      _target_: contrib.L96.models.BaseObsCost
+      w: 1.0
+
+  test_metrics: ${metrics.test_metrics}
+  pre_metric_fn:
+    _target_: xarray.Dataset.isel
+    _partial_: True
+    time: {_target_: builtins.slice, _args_: [1000, 10000]}
+    lat: ${domain.test.lat}
+    lon: ${domain.test.lon}
+
+metrics:
+  nrmse_scores: {_target_: ocean4dvarnet.utils.rmse_based_scores_from_ds, _partial_: True}
+  psd_scores: {_target_: ocean4dvarnet.utils.psd_based_scores_from_ds, _partial_: True}
+  get0: {_target_: operator.itemgetter, _args_: [0]}
+  get1: {_target_: operator.itemgetter, _args_: [1]}
+  test_metrics:
+    'mu': {_target_: ocean4dvarnet.utils.pipe, _partial_: true, fns: ['${metrics.nrmse_scores}', '${metrics.get0}']}
+    'sig': {_target_: ocean4dvarnet.utils.pipe, _partial_: true, fns: ['${metrics.nrmse_scores}', '${metrics.get1}']}
+    'lx': {_target_: ocean4dvarnet.utils.pipe, _partial_: true, fns: ['${metrics.psd_scores}', '${metrics.get0}']}
+    'lt': {_target_: ocean4dvarnet.utils.pipe, _partial_: true, fns: ['${metrics.psd_scores}', '${metrics.get1}']}
+
+entrypoints:
+  - _target_: pytorch_lightning.seed_everything
+    seed: 333
+  - _target_: ocean4dvarnet.train.base_training
+    trainer: ${trainer}
+    lit_mod: ${model}
+    dm: ${datamodule}
+
+defaults:
+  - /domain: l96_sim_40
+  - _self_
